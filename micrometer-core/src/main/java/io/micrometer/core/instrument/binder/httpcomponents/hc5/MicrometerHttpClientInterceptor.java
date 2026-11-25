@@ -23,10 +23,7 @@ import io.micrometer.core.instrument.binder.http.Outcome;
 import org.apache.hc.core5.http.HttpRequest;
 import org.apache.hc.core5.http.HttpRequestInterceptor;
 import org.apache.hc.core5.http.HttpResponseInterceptor;
-import org.apache.hc.core5.http.protocol.HttpContext;
 
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 
 /**
@@ -53,8 +50,6 @@ public class MicrometerHttpClientInterceptor {
 
     private static final String METER_NAME = "httpcomponents.httpclient.request";
 
-    private final Map<HttpContext, Timer.ResourceSample> timerByHttpContext = new ConcurrentHashMap<>();
-
     private final HttpRequestInterceptor requestInterceptor;
 
     private final HttpResponseInterceptor responseInterceptor;
@@ -68,17 +63,21 @@ public class MicrometerHttpClientInterceptor {
      */
     public MicrometerHttpClientInterceptor(MeterRegistry meterRegistry, Function<HttpRequest, String> uriMapper,
             Iterable<Tag> extraTags, boolean exportTagsForRoute) {
-        this.requestInterceptor = (request, entityDetails, context) -> timerByHttpContext.put(context,
-                Timer.resource(meterRegistry, METER_NAME)
-                    .tags("method", request.getMethod(), "uri", uriMapper.apply(request)));
+        this.requestInterceptor = (request, entityDetails, context) -> {
+            Timer.ResourceSample sample = Timer.resource(meterRegistry, METER_NAME)
+                .tags("method", request.getMethod(), "uri", uriMapper.apply(request));
+            context.setAttribute("micrometer.timerSample", sample);
+        };
 
         this.responseInterceptor = (response, entityDetails, context) -> {
-            timerByHttpContext.remove(context)
-                .tag("status", Integer.toString(response.getCode()))
-                .tag("outcome", Outcome.forStatus(response.getCode()).name())
-                .tags(exportTagsForRoute ? HttpContextUtils.generateTagsForRoute(context) : Tags.empty())
-                .tags(extraTags)
-                .close();
+            Object sampleObj = context.removeAttribute("micrometer.timerSample");
+            if (sampleObj instanceof Timer.ResourceSample) {
+                ((Timer.ResourceSample) sampleObj).tag("status", Integer.toString(response.getCode()))
+                    .tag("outcome", Outcome.forStatus(response.getCode()).name())
+                    .tags(exportTagsForRoute ? HttpContextUtils.generateTagsForRoute(context) : Tags.empty())
+                    .tags(extraTags)
+                    .close();
+            }
         };
     }
 
