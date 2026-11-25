@@ -105,6 +105,10 @@ public class LoggingMeterRegistry extends StepMeterRegistry {
         start(threadFactory);
     }
 
+    private static String sanitize(String value) {
+        return value.replace('\r', '_').replace('\n', '_');
+    }
+
     private Function<Meter, String> defaultMeterIdPrinter() {
         return (meter) -> getConventionName(meter.getId()) + getConventionTags(meter.getId()).stream()
             .map(t -> t.getKey() + "=" + t.getValue())
@@ -202,7 +206,8 @@ public class LoggingMeterRegistry extends StepMeterRegistry {
                 false);
     }
 
-    class Printer {
+    // VisibleForTesting
+    final class Printer {
 
         private final Meter meter;
 
@@ -211,7 +216,7 @@ public class LoggingMeterRegistry extends StepMeterRegistry {
         }
 
         String id() {
-            return meterIdPrinter.apply(meter);
+            return sanitize(meterIdPrinter.apply(meter));
         }
 
         String time(double time) {
