@@ -1,0 +1,125 @@
+name: Seal Build
+# Authored for the sealed build: upstream builds and tests on CircleCI only
+# (.circleci/config.yml, cimg/openjdk:21.0.2). This mirrors its `build` /
+# `docker-tests` jobs, scoped to micrometer-core and micrometer-registry-statsd.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test task + selector, e.g. ":micrometer-core:test --tests FooTest" (empty = full suite)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx2048m -XX:+HeapDumpOnOutOfMemoryError"'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 11 (mrjar java11 source set toolchain)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+          cache: gradle
+
+      - name: Set up JDK 21.0.2 (release build JDK)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.2'
+          cache: gradle
+
+      - name: Allow testcontainers' Docker API version on the runner's dockerd
+        run: |
+          sudo mkdir -p /etc/systemd/system/docker.service.d
+          printf '[Service]\nEnvironment=DOCKER_MIN_API_VERSION=1.24\n' | sudo tee /etc/systemd/system/docker.service.d/min-api.conf
+          sudo systemctl daemon-reload
+          sudo systemctl restart docker
+          docker version
+
+      - name: Write test-reporting init script
+        run: |
+          cat > "$RUNNER_TEMP/test-report.gradle" <<'EOF'
+          allprojects {
+              tasks.withType(Test).configureEach { t ->
+                  t.testLogging {
+                      events 'failed', 'skipped'
+                      exceptionFormat 'full'
+                  }
+                  t.filter.failOnNoMatchingTests = false
+                  t.afterSuite { desc, result ->
+                      if (desc.parent == null) {
+                          println "TEST SUMMARY ${t.path}: ${result.testCount} tests, ${result.successfulTestCount} passed, ${result.failedTestCount} failed, ${result.skippedTestCount} skipped (${result.resultType})"
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Build and test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          ARGS="--no-daemon --console=plain --stacktrace --no-build-cache -I $RUNNER_TEMP/test-report.gradle \
+            -Porg.gradle.java.installations.paths=$JAVA_HOME_11_X64,$JAVA_HOME_21_X64 \
+            -Porg.gradle.java.installations.auto-download=false \
+            -Prelease.version=1.12.5 -Prelease.stage=final -Prelease.disableGitChecks=true -PcompatibleVersion=SKIP"
+          if [ -n "$TEST_FILTER" ]; then
+            ./gradlew $ARGS $TEST_FILTER
+          else
+            ./gradlew $ARGS :micrometer-core:test :micrometer-core:java11Test :micrometer-core:dockerTest :micrometer-registry-statsd:test
+          fi
+          ./gradlew $ARGS :micrometer-core:jar
+
+      - name: Skipped-test report
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re, xml.etree.ElementTree as ET
+          total = passed = failed = skipped = 0
+          skips = []
+          for f in glob.glob('**/build/test-results/**/*.xml', recursive=True):
+              try:
+                  root = ET.parse(f).getroot()
+              except ET.ParseError:
+                  continue
+              for tc in root.iter('testcase'):
+                  total += 1
+                  if tc.find('skipped') is not None:
+                      skipped += 1
+                      sk = tc.find('skipped')
+                      reason = (sk.get('message') or '').strip()
+                      cls = tc.get('classname', '')
+                      if not reason:
+                          base = cls.split('$')[0].replace('.', '/')
+                          srcs = glob.glob(f'**/src/*/java*/{base}.java', recursive=True) + glob.glob(f'**/src/*/kotlin/{base}.kt', recursive=True)
+                          hits = []
+                          for s in srcs:
+                              for line in open(s, encoding='utf-8', errors='replace'):
+                                  if re.search(r'@(Disabled|EnabledIf|DisabledIf|DisabledOn|EnabledOn|DisabledFor|EnabledFor)\w*|assume(True|False|That)', line):
+                                      hits.append(line.strip())
+                          reason = 'source annotation/assumption: ' + ' | '.join(sorted(set(hits))[:3]) if hits else 'skipped by JUnit (no message)'
+                      skips.append(f"SKIPPED {cls}.{tc.get('name')} -- reason: {reason}")
+                  elif tc.find('failure') is not None or tc.find('error') is not None:
+                      failed += 1
+                  else:
+                      passed += 1
+          for s in sorted(skips):
+              print(s)
+          print(f"OVERALL TEST RESULTS: {total} tests, {passed} passed, {failed} failed, {skipped} skipped")
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: micrometer-core-jar
+          path: micrometer-core/build/libs/micrometer-core-1.12.5.jar
+          if-no-files-found: error
